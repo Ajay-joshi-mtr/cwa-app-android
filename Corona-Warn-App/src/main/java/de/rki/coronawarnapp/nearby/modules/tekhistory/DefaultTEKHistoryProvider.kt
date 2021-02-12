@@ -13,7 +13,6 @@ import com.google.android.gms.nearby.exposurenotification.ExposureNotificationSt
 import com.google.android.gms.nearby.exposurenotification.TemporaryExposureKey
 import de.rki.coronawarnapp.nearby.modules.version.ENFVersion
 import de.rki.coronawarnapp.util.di.AppContext
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeout
@@ -139,7 +138,7 @@ class DefaultTEKHistoryProvider @Inject constructor(
             try {
                 Timber.d("Pre-Auth retrieving TEK.")
                 getPreAuthorizedExposureKeys().also {
-                    Timber.d("Pre-Auth TEK:${it.joinToString("\n")}")
+                    Timber.d("Pre-Auth TEK: %s", it.joinToString("\n"))
                 }
             } catch (exception: Exception) {
                 Timber.d(exception, "Pre-Auth retrieving TEK failed")
@@ -154,45 +153,49 @@ class DefaultTEKHistoryProvider @Inject constructor(
         }
     }
 
-    private suspend fun getPreAuthorizedExposureKeys(): List<TemporaryExposureKey> =
-        // Timeout after 20 sec if receiver did get called
-        withTimeout(20_000) {
-            coroutineScope {
-                client.requestPreAuthorizedTemporaryExposureKeyRelease().await()
-                Timber.i("requestPreAuthorizedTemporaryExposureKeyRelease is done")
-                val intent = awaitReceivedBroadcast()
-                val hasExtra = intent.hasExtra(EXTRA_TEMPORARY_EXPOSURE_KEY_LIST)
-                Timber.i("awaitReceivedBroadcast:$hasExtra")
-                val tempExposureKeys =
-                    if (hasExtra) {
-                        intent.getParcelableArrayListExtra<TemporaryExposureKey>(EXTRA_TEMPORARY_EXPOSURE_KEY_LIST)
-                    } else {
-                        listOf()
-                    }
-                tempExposureKeys
-            }
-        }
-
-    private suspend fun awaitReceivedBroadcast(): Intent =
+    // Timeout after 20 sec if receiver did not get called
+    private suspend fun getPreAuthorizedExposureKeys(): List<TemporaryExposureKey> = withTimeout(20_000) {
         suspendCancellableCoroutine { cont ->
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(context: Context, intent: Intent) {
-                    cont.resume(intent)
-                    context.unregisterReceiver(this)
-                    Timber.d("unregisterReceiver")
+                    Timber.d("getPreAuthorizedExposureKeys():intent=%s", intent)
+
+                    val tempExposureKeys = intent
+                        .getParcelableArrayListExtra<TemporaryExposureKey>(EXTRA_TEMPORARY_EXPOSURE_KEY_LIST)
+                        ?: emptyList()
+
+                    cont.resume(tempExposureKeys)
                 }
             }
-            context.registerReceiver(
-                receiver,
-                IntentFilter(
-                    ExposureNotificationClient.ACTION_PRE_AUTHORIZE_RELEASE_PHONE_UNLOCKED
+            val receiverCleanUp = {
+                try {
+                    context.unregisterReceiver(receiver)
+                } catch (e: IllegalArgumentException) {
+                    Timber.e(e, "Failed to unregister preauth broadcast receiver")
+                }
+            }
+            try {
+                context.registerReceiver(
+                    receiver,
+                    IntentFilter(ExposureNotificationClient.ACTION_PRE_AUTHORIZE_RELEASE_PHONE_UNLOCKED)
                 )
-            )
-            cont.invokeOnCancellation {
-                Timber.d(it, "unregisterReceiver")
-                context.unregisterReceiver(receiver)
+                cont.invokeOnCancellation {
+                    Timber.d(it, "unregisterReceiver")
+                    receiverCleanUp()
+                }
+                client.requestPreAuthorizedTemporaryExposureKeyRelease()
+                    .addOnSuccessListener {
+                        Timber.i("getPreAuthorizedExposureKeys(): Successful waiting for broadcast.")
+                    }
+                    .addOnFailureListener {
+                        Timber.e(it, "getPreAuthorizedExposureKeys(): failed.")
+                        cont.resumeWithException(it)
+                    }
+            } finally {
+                receiverCleanUp()
             }
         }
+    }
 
     private inline val Exception.isResolvable get() = this is ApiException && this.status.hasResolution()
 }
